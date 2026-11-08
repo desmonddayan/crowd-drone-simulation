@@ -87,6 +87,12 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Enable optional background Ollama (Gemma 4) strategic layer",
     )
+    parser.add_argument(
+        "--save-video",
+        type=str,
+        default="",
+        help="Optional path to save the rendered 3D dashboard video (e.g. demo_video.mp4)",
+    )
     return parser.parse_args(argv)
 
 
@@ -121,6 +127,13 @@ def run_mock_simulation(args: argparse.Namespace) -> Dict[str, object]:
     print(
         f"[START] Mock Simulation | Drones={n_drones} | People={args.people} | Steps={args.steps}"
     )
+
+    video_writer = None
+    if getattr(args, "save_video", ""):
+        import cv2
+
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        video_writer = cv2.VideoWriter(str(args.save_video), fourcc, 15.0, (1360, 780))
 
     try:
         for step_idx in range(int(args.steps)):
@@ -173,7 +186,7 @@ def run_mock_simulation(args: argparse.Namespace) -> Dict[str, object]:
             post_guide_exit_a_density = exit_a_d
 
             # Render OpenCV HUD frame
-            dashboard.render_frame(
+            hud_frame = dashboard.render_frame(
                 current_time=sim.sim_time,
                 density_map=density_map,
                 drone_states=drone_states,
@@ -182,6 +195,8 @@ def run_mock_simulation(args: argparse.Namespace) -> Dict[str, object]:
                 decoded_rgb_frames=perception.last_decoded_rgb,
                 escalations=escalations,
             )
+            if video_writer is not None:
+                video_writer.write(hud_frame)
 
             if step_idx % 40 == 0 or step_idx == int(args.steps) - 1:
                 state_counts: Dict[str, int] = {}
@@ -194,6 +209,8 @@ def run_mock_simulation(args: argparse.Namespace) -> Dict[str, object]:
                     f"Guided redirects={sim.world.guided_switches_count}"
                 )
     finally:
+        if video_writer is not None:
+            video_writer.release()
         if strategist is not None:
             strategist.stop()
         logger.close()

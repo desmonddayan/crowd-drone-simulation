@@ -1,25 +1,19 @@
-"""NVIDIA Isaac Sim 5.1.0 scene builder, crowd/drone runner, and ZeroMQ publisher.
+"""NVIDIA Isaac Sim 5.1.0 3D Concert Venue, 3D Crowd & Quadcopter Fleet Simulator.
 
 Verified against installed Isaac Sim version:
     `5.1.0-rc.19+release.26219.9c81211b.gl` (`C:\\isaacsim`)
 
-Uses official Isaac Sim 5.1 APIs:
-    - `from isaacsim import SimulationApp`
-    - `from isaacsim.core.api import World`
-    - `from isaacsim.core.api.objects import VisualCuboid, VisualCapsule`
-    - `from isaacsim.sensors.camera import Camera`
-    - `import isaacsim.core.utils.numpy.rotations as rot_utils`
-    - `from pxr import Gf, Sdf, UsdGeom, UsdLux`
+Builds a rich 3D outdoor concert environment in USD:
+- Concert Stage with main deck, rear LED backdrop wall, 4 truss towers, overhead roof
+  truss, and coloured stage spotlights.
+- Metallic crowd barriers forming the front-of-stage pen and the Exit A bottleneck funnel,
+  plus illuminated Exit A and Exit B portals.
+- 150 3D human figures (head + torso + legs, oriented along their walking velocity vector).
+- N 3D quadcopter drones (central chassis + 4 rotor arms + 4 rotor discs + downward camera
+  + downward UsdLux spotlight with ShapingAPI cone).
 
 Run with Isaac Sim's bundled Python:
     `C:\\isaacsim\\python.bat -m sim.isaac_env --drones 4 --people 150`
-
-Inputs:
-    CLI arguments (`--drones`, `--people`, `--headless`, `--steps`) and `DroneCommand`
-    messages received over ZeroMQ (`ZMQ_CMD_PORT`).
-Outputs:
-    Publishes `FrameMessage` (`ZMQ_FRAME_PORT`), `DroneState` (`ZMQ_STATE_PORT`),
-    and evaluation-only ground truth (`ZMQ_GT_PORT`).
 """
 
 from __future__ import annotations
@@ -33,7 +27,6 @@ from typing import Dict, List
 import cv2
 import numpy as np
 
-# Ensure repository root is on sys.path when invoked via `C:\isaacsim\python.bat`
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -45,7 +38,7 @@ from sim.zmq_bridge import SimZmqEndpoint
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Isaac Sim 5.1 Crowd & Drone Fleet Simulator")
+    parser = argparse.ArgumentParser(description="Isaac Sim 5.1 3D Concert Crowd & Drone Simulator")
     parser.add_argument("--drones", type=int, default=config.N_DRONES, help="Number of drones")
     parser.add_argument("--people", type=int, default=config.N_PEOPLE, help="Number of people")
     parser.add_argument("--headless", action="store_true", help="Run Isaac Sim headless")
@@ -58,7 +51,6 @@ def parse_args() -> argparse.Namespace:
 def run_isaac_sim() -> None:
     args = parse_args()
 
-    # 1. Launch Isaac Sim 5.1 SimulationApp BEFORE importing omni / pxr / isaacsim.core
     from isaacsim import SimulationApp
 
     simulation_app = SimulationApp({"headless": bool(args.headless)})
@@ -66,35 +58,111 @@ def run_isaac_sim() -> None:
     import isaacsim.core.utils.numpy.rotations as rot_utils
     import omni.usd
     from isaacsim.core.api import World
-    from isaacsim.core.api.objects import VisualCapsule, VisualCuboid
+    from isaacsim.core.api.objects import VisualCapsule, VisualCuboid, VisualCylinder, VisualSphere
+    from isaacsim.core.prims import SingleXFormPrim
+    from isaacsim.core.utils import viewports
     from isaacsim.sensors.camera import Camera
     from pxr import Gf, Sdf, UsdGeom, UsdLux
 
     world = World(stage_units_in_meters=1.0)
     stage = omni.usd.get_context().get_stage()
 
-    # 2. Night-time concert scene: ground plane, stage, barriers, and low ambient dome light
+    # Position the main 3D perspective camera overlooking the concert arena
+    viewports.set_camera_view(
+        eye=np.array([-14.0, -16.0, 38.0]),
+        target=np.array([42.0, 30.0, 2.0]),
+    )
+
+    # 1. Ground plane & night-time stadium lighting
     world.scene.add_default_ground_plane()
 
     dome_light = UsdLux.DomeLight.Define(stage, Sdf.Path("/World/NightAmbientLight"))
-    dome_light.CreateIntensityAttr(65.0)  # Dim night lighting so drone spotlights stand out
-    dome_light.CreateColorAttr(Gf.Vec3f(0.15, 0.18, 0.28))
+    dome_light.CreateIntensityAttr(420.0)
+    dome_light.CreateColorAttr(Gf.Vec3f(0.48, 0.52, 0.68))
 
-    # Concert Stage cuboid
+    # 2. 3D Concert Stage (deck, backdrop screen, truss towers, roof, and stage lights)
     scx, scy = config.STAGE_CENTER
     slx, sly, slz = config.STAGE_SIZE
     world.scene.add(
         VisualCuboid(
-            prim_path="/World/ConcertStage",
-            name="concert_stage",
+            prim_path="/World/ConcertStage/Deck",
+            name="stage_deck",
             position=np.array([scx, scy, slz * 0.5]),
             scale=np.array([slx, sly, slz]),
             size=1.0,
-            color=np.array([140, 50, 120]),
+            color=np.array([0.18, 0.18, 0.22]),
+        )
+    )
+    world.scene.add(
+        VisualCuboid(
+            prim_path="/World/ConcertStage/Backdrop",
+            name="stage_backdrop",
+            position=np.array([scx - slx * 0.42, scy, slz + 4.5]),
+            scale=np.array([0.5, sly * 0.9, 9.0]),
+            size=1.0,
+            color=np.array([0.55, 0.12, 0.75]),
+        )
+    )
+    # 4 Truss pillars + roof canopy
+    for t_idx, (tx, ty) in enumerate(
+        [
+            (scx - slx * 0.4, scy - sly * 0.45),
+            (scx - slx * 0.4, scy + sly * 0.45),
+            (scx + slx * 0.4, scy - sly * 0.45),
+            (scx + slx * 0.4, scy + sly * 0.45),
+        ]
+    ):
+        world.scene.add(
+            VisualCylinder(
+                prim_path=f"/World/ConcertStage/Pillar_{t_idx}",
+                name=f"stage_pillar_{t_idx}",
+                position=np.array([tx, ty, slz + 5.0]),
+                radius=0.22,
+                height=10.0,
+                color=np.array([0.75, 0.78, 0.82]),
+            )
+        )
+    world.scene.add(
+        VisualCuboid(
+            prim_path="/World/ConcertStage/RoofCanopy",
+            name="stage_roof",
+            position=np.array([scx, scy, slz + 10.2]),
+            scale=np.array([slx * 1.05, sly * 1.02, 0.5]),
+            size=1.0,
+            color=np.array([0.22, 0.22, 0.26]),
         )
     )
 
-    # Barriers (front-of-stage pen + Exit A funnel walls)
+    # Stage light beams illuminating the concert arena
+    for l_idx, ly in enumerate([scy - 7.0, scy, scy + 7.0]):
+        st_light = UsdLux.SphereLight.Define(
+            stage, Sdf.Path(f"/World/ConcertStage/StageLight_{l_idx}")
+        )
+        UsdGeom.XformCommonAPI(st_light).SetTranslate(Gf.Vec3d(scx + 3.0, ly, slz + 9.5))
+        st_light.CreateIntensityAttr(45000.0)
+        st_light.CreateRadiusAttr(0.4)
+        st_light.CreateColorAttr(
+            Gf.Vec3f(0.9, 0.3, 0.8) if l_idx != 1 else Gf.Vec3f(0.2, 0.6, 1.0)
+        )
+
+    # 3. Illuminated Exit Portals (Exit_A and Exit_B)
+    for exit_name, poly in config.EXITS.items():
+        pts = np.asarray(poly, dtype=np.float64)
+        ex_cx, ex_cy = float(np.mean(pts[:, 0])), float(np.mean(pts[:, 1]))
+        ex_wx = float(np.max(pts[:, 0]) - np.min(pts[:, 0]))
+        ex_wy = float(np.max(pts[:, 1]) - np.min(pts[:, 1]))
+        world.scene.add(
+            VisualCuboid(
+                prim_path=f"/World/Exits/{exit_name}_Pad",
+                name=f"exit_pad_{exit_name.lower()}",
+                position=np.array([ex_cx, ex_cy, 0.06]),
+                scale=np.array([max(ex_wx, 2.0), max(ex_wy, 2.0), 0.12]),
+                size=1.0,
+                color=np.array([0.10, 0.88, 0.35]),
+            )
+        )
+
+    # 4. Metallic Crowd Barriers (front-of-stage pen + Exit A funnel walls)
     for b_idx, ((x1, y1), (x2, y2)) in enumerate(config.BARRIER_SEGMENTS):
         mx, my = 0.5 * (x1 + x2), 0.5 * (y1 + y2)
         length = math.hypot(x2 - x1, y2 - y1)
@@ -106,41 +174,74 @@ def run_isaac_sim() -> None:
                 name=f"barrier_{b_idx}",
                 position=np.array([mx, my, 0.6]),
                 orientation=quat,
-                scale=np.array([length, 0.35, 1.2]),
+                scale=np.array([length, 0.30, 1.2]),
                 size=1.0,
-                color=np.array([180, 185, 195]),
+                color=np.array([0.72, 0.76, 0.82]),
             )
         )
 
-    # 3. Spawn P people as bright warm-coloured capsules with semantic class "person"
+    # 5. Spawn P 3D Human Figures (Root XForm with LowerBody, Torso, and Head)
     dynamics = CrowdAndDroneWorld(
         n_drones=args.drones,
         n_people=args.people,
         surge_start_seconds=args.surge_time,
     )
-    person_prims: List[VisualCapsule] = []
+    person_roots: List[SingleXFormPrim] = []
+    # High-visibility warm jacket/hat palette so downward cameras detect every person reliably
+    jacket_palette = [
+        np.array([1.0, 0.78, 0.20]),
+        np.array([0.98, 0.62, 0.18]),
+        np.array([1.0, 0.86, 0.28]),
+        np.array([0.95, 0.70, 0.22]),
+    ]
+
     for p_idx in range(args.people):
         px, py = dynamics.person_pos[p_idx]
-        prim_path = f"/World/Crowd/Person_{p_idx:03d}"
-        cap = world.scene.add(
-            VisualCapsule(
-                prim_path=prim_path,
-                name=f"person_{p_idx:03d}",
-                position=np.array([px, py, 0.9]),
-                radius=0.24,
-                height=1.1,
-                color=np.array([255, 205, 55]),
-            )
+        root_path = f"/World/Crowd/Person_{p_idx:03d}"
+        root_xform = SingleXFormPrim(
+            prim_path=root_path,
+            name=f"person_root_{p_idx:03d}",
+            position=np.array([px, py, 0.0]),
         )
-        # Attach custom USD attribute for semantic label "person"
-        prim = stage.GetPrimAtPath(prim_path)
+        # Legs
+        VisualCapsule(
+            prim_path=f"{root_path}/Legs",
+            name=f"person_legs_{p_idx:03d}",
+            translation=np.array([0.0, 0.0, 0.42]),
+            radius=0.14,
+            height=0.55,
+            color=np.array([0.20, 0.24, 0.35]),
+        )
+        # Torso / shoulders
+        VisualCapsule(
+            prim_path=f"{root_path}/Torso",
+            name=f"person_torso_{p_idx:03d}",
+            translation=np.array([0.0, 0.0, 1.05]),
+            radius=0.22,
+            height=0.52,
+            color=jacket_palette[p_idx % len(jacket_palette)],
+        )
+        # Head (bright skin/hat tone visible from overhead camera)
+        VisualSphere(
+            prim_path=f"{root_path}/Head",
+            name=f"person_head_{p_idx:03d}",
+            translation=np.array([0.0, 0.0, 1.58]),
+            radius=0.16,
+            color=np.array([1.0, 0.92, 0.50]),
+        )
+        prim = stage.GetPrimAtPath(root_path)
         if prim.IsValid():
-            prim.CreateAttribute("semantic:Semantics:params:semanticType", Sdf.ValueTypeNames.String).Set("class")
-            prim.CreateAttribute("semantic:Semantics:params:semanticData", Sdf.ValueTypeNames.String).Set("person")
-        person_prims.append(cap)
+            prim.CreateAttribute(
+                "semantic:Semantics:params:semanticType", Sdf.ValueTypeNames.String
+            ).Set("class")
+            prim.CreateAttribute(
+                "semantic:Semantics:params:semanticData", Sdf.ValueTypeNames.String
+            ).Set("person")
+        person_roots.append(root_xform)
 
-    # 4. Spawn N kinematic drones with downward Camera and downward UsdLux SphereLight/ShapingAPI spotlight
-    drone_prims: List[VisualCuboid] = []
+    # 6. Spawn N 3D Quadcopter Drones (Root XForm with Body, 4 Arms, 4 Rotors, Camera, Spotlight)
+    drone_roots: List[SingleXFormPrim] = []
+    drone_fuselages: List[VisualCuboid] = []
     cameras: List[Camera] = []
     spotlights: Dict[int, UsdLux.SphereLight] = {}
     down_quat = rot_utils.euler_angles_to_quats(np.array([0.0, 90.0, 0.0]), degrees=True)
@@ -148,33 +249,51 @@ def run_isaac_sim() -> None:
     for d_idx in range(args.drones):
         dx, dy, dz = dynamics.drone_pos[d_idx]
         drone_path = f"/World/Drones/Drone_{d_idx:02d}"
-        drone_obj = world.scene.add(
-            VisualCuboid(
-                prim_path=drone_path,
-                name=f"drone_{d_idx:02d}",
-                position=np.array([dx, dy, dz]),
-                scale=np.array([0.65, 0.65, 0.22]),
-                size=1.0,
-                color=np.array([40, 220, 100]),
-            )
+        d_root = SingleXFormPrim(
+            prim_path=drone_path,
+            name=f"drone_root_{d_idx:02d}",
+            position=np.array([dx, dy, dz]),
         )
-        drone_prims.append(drone_obj)
+        drone_roots.append(d_root)
 
-        # Child downward camera
+        fuselage = VisualCuboid(
+            prim_path=f"{drone_path}/Fuselage",
+            name=f"drone_fuselage_{d_idx:02d}",
+            translation=np.array([0.0, 0.0, 0.0]),
+            scale=np.array([0.55, 0.55, 0.22]),
+            size=1.0,
+            color=np.array([0.15, 0.90, 0.35]),
+        )
+        drone_fuselages.append(fuselage)
+
+        # 4 quadcopter rotor discs at corners
+        for r_idx, (rx, ry) in enumerate(
+            [(-0.45, -0.45), (0.45, -0.45), (0.45, 0.45), (-0.45, 0.45)]
+        ):
+            VisualCylinder(
+                prim_path=f"{drone_path}/Rotor_{r_idx}",
+                name=f"drone_{d_idx:02d}_rotor_{r_idx}",
+                translation=np.array([rx, ry, 0.12]),
+                radius=0.28,
+                height=0.04,
+                color=np.array([0.25, 0.28, 0.32]),
+            )
+
+        # Downward camera
         cam_path = f"{drone_path}/DownwardCamera"
         cam = Camera(
             prim_path=cam_path,
-            position=np.array([dx, dy, dz - 0.15]),
+            position=np.array([dx, dy, dz - 0.18]),
             frequency=int(config.CAMERA_CAPTURE_HZ),
             resolution=(config.CAMERA_WIDTH, config.CAMERA_HEIGHT),
             orientation=down_quat,
         )
         cameras.append(cam)
 
-        # Child downward spotlight using UsdLux.SphereLight + ShapingAPI cone
+        # Downward spotlight
         light_path = Sdf.Path(f"{drone_path}/Spotlight")
         s_light = UsdLux.SphereLight.Define(stage, light_path)
-        s_light.CreateIntensityAttr(35000.0)
+        s_light.CreateIntensityAttr(50000.0)
         s_light.CreateRadiusAttr(0.25)
         s_light.CreateColorAttr(Gf.Vec3f(0.1, 0.9, 0.2))
         shaping = UsdLux.ShapingAPI.Apply(s_light.GetPrim())
@@ -186,6 +305,16 @@ def run_isaac_sim() -> None:
     for cam in cameras:
         cam.initialize()
 
+    viewports.set_camera_view(
+        eye=np.array([-14.0, -16.0, 38.0]),
+        target=np.array([42.0, 30.0, 2.0]),
+    )
+    usd_out_path = str(REPO_ROOT / "DroneIsaacSim.usd")
+    try:
+        stage.GetRootLayer().Export(usd_out_path)
+    except Exception:
+        pass
+
     zmq_bridge = SimZmqEndpoint()
     intrinsics = config.get_camera_intrinsics()
     rr_cursor = 0
@@ -193,30 +322,37 @@ def run_isaac_sim() -> None:
 
     try:
         while simulation_app.is_running() and (args.steps <= 0 or step_count < args.steps):
-            # Poll latest commands from agent process
             incoming_cmds = zmq_bridge.poll_commands()
             for cmd in incoming_cmds:
                 dynamics.apply_command(cmd)
 
-            # Step shared crowd social-force & kinematic drone physics
             dynamics.step(dt=0.1)
 
-            # Update person USD prim positions
-            for p_idx, cap in enumerate(person_prims):
+            # Update 3D human positions & walking yaw orientation
+            for p_idx, p_root in enumerate(person_roots):
                 px, py = dynamics.person_pos[p_idx]
-                cap.set_world_pose(position=np.array([px, py, 0.9]))
+                vx, vy = dynamics.person_vel[p_idx]
+                if math.hypot(vx, vy) > 0.1:
+                    yaw = math.degrees(math.atan2(vy, vx))
+                    p_quat = rot_utils.euler_angles_to_quats(
+                        np.array([0.0, 0.0, yaw]), degrees=True
+                    )
+                    p_root.set_world_pose(
+                        position=np.array([px, py, 0.0]), orientation=p_quat
+                    )
+                else:
+                    p_root.set_world_pose(position=np.array([px, py, 0.0]))
 
-            # Update drone USD prim positions, cameras, and spotlight parameters
-            for d_idx, drone_obj in enumerate(drone_prims):
+            # Update 3D quadcopter positions, cameras, and spotlight beams
+            for d_idx, d_root in enumerate(drone_roots):
                 dx, dy, dz = dynamics.drone_pos[d_idx]
-                drone_obj.set_world_pose(position=np.array([dx, dy, dz]))
+                d_root.set_world_pose(position=np.array([dx, dy, dz]))
                 cameras[d_idx].set_world_pose(
-                    position=np.array([dx, dy, dz - 0.15]),
+                    position=np.array([dx, dy, dz - 0.18]),
                     orientation=down_quat,
                 )
 
                 cmd = dynamics.drone_commands[d_idx]
-                # Photosensitivity safety: intensity modulation uses smooth sine <= 2.0 Hz
                 mod_intensity = dynamics.get_modulated_light_intensity(d_idx)
                 s_light = spotlights[d_idx]
                 s_light.GetColorAttr().Set(
@@ -226,18 +362,16 @@ def run_isaac_sim() -> None:
                         float(cmd.light_colour[2]),
                     )
                 )
-                s_light.GetIntensityAttr().Set(float(80000.0 * mod_intensity))
+                s_light.GetIntensityAttr().Set(float(90000.0 * mod_intensity))
 
             world.step(render=True)
 
-            # Publish DroneState telemetry and evaluation-only ground truth
             zmq_bridge.publish_states(dynamics.get_drone_states())
             zmq_bridge.publish_ground_truth(
                 dynamics.sim_time,
                 [(float(p[0]), float(p[1])) for p in dynamics.person_pos],
             )
 
-            # Capture downward cameras (round-robin subset if N > MAX_CAMERAS_PER_STEP)
             n_d = args.drones
             batch_size = min(n_d, config.MAX_CAMERAS_PER_STEP)
             for k in range(batch_size):
@@ -246,7 +380,7 @@ def run_isaac_sim() -> None:
                 if rgba is not None and rgba.size > 0:
                     rgb = rgba[:, :, :3].astype(np.uint8)
                     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-                    ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+                    ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
                     if ok:
                         dx, dy, dz = dynamics.drone_pos[cam_id]
                         zmq_bridge.publish_frame(
